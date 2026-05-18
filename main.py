@@ -40,6 +40,7 @@ def root():
     }
 
 
+@app.head("/health")
 @app.get("/health")
 def health():
     """헬스체크 — UptimeRobot이 5분마다 호출해서 슬립 방지"""
