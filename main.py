@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List
 import datetime
 import asyncio
+import re
 
 app = FastAPI()
 
@@ -17,68 +18,132 @@ app.add_middleware(
 
 # ──────────────────────────────────────────
 # 종목 검색용 전체 목록 캐시
-# 서버 시작 시 백그라운드에서 로드
 # ──────────────────────────────────────────
-ticker_map: dict = {}   # { "005930": "삼성전자" }
+ticker_map: dict = {}
 ticker_map_ready = False
+ticker_map_source = ""   # 'fdr', 'pykrx', 'empty'
 
-def get_recent_trading_day() -> str:
-    """오늘 또는 가장 최근 거래일 (YYYYMMDD)"""
-    d = datetime.datetime.now()
-    # 주말이면 금요일로
-    if d.weekday() == 5:  # 토
-        d -= datetime.timedelta(days=1)
-    elif d.weekday() == 6:  # 일
-        d -= datetime.timedelta(days=2)
-    return d.strftime("%Y%m%d")
+
+def _load_via_fdr():
+    """FinanceDataReader로 전체 KRX 종목 한 번에 가져오기 (가장 안정적)"""
+    import FinanceDataReader as fdr
+    df = fdr.StockListing('KRX')
+    result = {}
+    if df is None or len(df) == 0:
+        return result
+    code_col = None
+    name_col = None
+    for c in ['Code', 'Symbol', 'ISU_CD']:
+        if c in df.columns:
+            code_col = c
+            break
+    for c in ['Name', 'Korean Name', 'ISU_NM']:
+        if c in df.columns:
+            name_col = c
+            break
+    if not code_col or not name_col:
+        return result
+    for _, row in df.iterrows():
+        try:
+            code = str(row[code_col]).strip().zfill(6)
+            name = str(row[name_col]).strip()
+            if code.isdigit() and len(code) == 6 and name and name != 'nan':
+                result[code] = name
+        except Exception:
+            continue
+    return result
+
+
+def _load_via_pykrx():
+    """pykrx fallback — 최근 14일 안에서 데이터 있는 거래일 찾기"""
+    result = {}
+    today = datetime.datetime.now()
+    for days_ago in range(0, 14):
+        try:
+            d = today - datetime.timedelta(days=days_ago)
+            if d.weekday() >= 5:
+                continue
+            date_str = d.strftime("%Y%m%d")
+            try:
+                kospi = stock.get_market_ticker_list(date=date_str, market="KOSPI")
+            except Exception:
+                kospi = []
+            try:
+                kosdaq = stock.get_market_ticker_list(date=date_str, market="KOSDAQ")
+            except Exception:
+                kosdaq = []
+            all_codes = list(kospi) + list(kosdaq)
+            if not all_codes:
+                continue
+            for code in all_codes:
+                try:
+                    name = stock.get_market_ticker_name(code)
+                    if name:
+                        result[code] = name
+                except Exception:
+                    pass
+            if result:
+                return result
+        except Exception:
+            continue
+    return result
+
 
 async def build_ticker_map():
-    """KOSPI + KOSDAQ 전체 종목 코드-이름 매핑 빌드 (백그라운드)"""
-    global ticker_map, ticker_map_ready
+    global ticker_map, ticker_map_ready, ticker_map_source
+    loop = asyncio.get_event_loop()
+
     try:
-        date = get_recent_trading_day()
-        result = {}
-        for market in ["KOSPI", "KOSDAQ"]:
-            try:
-                codes = stock.get_market_ticker_list(date=date, market=market)
-                for code in codes:
-                    if code not in result:
-                        try:
-                            name = stock.get_market_ticker_name(code)
-                            if name:
-                                result[code] = name
-                        except Exception:
-                            pass
-                    # 과도한 요청 방지
-                    await asyncio.sleep(0.005)
-            except Exception as e:
-                print(f"[ticker_map] {market} 로드 실패: {e}")
-        ticker_map = result
-        ticker_map_ready = True
-        print(f"[ticker_map] 로드 완료: {len(ticker_map)}개 종목")
+        result = await loop.run_in_executor(None, _load_via_fdr)
+        if result and len(result) > 100:
+            ticker_map = result
+            ticker_map_source = "fdr"
+            ticker_map_ready = True
+            print(f"[ticker_map] FDR 로드 성공: {len(ticker_map)}개")
+            return
     except Exception as e:
-        print(f"[ticker_map] 전체 실패: {e}")
+        print(f"[ticker_map] FDR 실패: {e}")
+
+    try:
+        result = await loop.run_in_executor(None, _load_via_pykrx)
+        if result and len(result) > 100:
+            ticker_map = result
+            ticker_map_source = "pykrx"
+            ticker_map_ready = True
+            print(f"[ticker_map] pykrx 로드 성공: {len(ticker_map)}개")
+            return
+    except Exception as e:
+        print(f"[ticker_map] pykrx 실패: {e}")
+
+    ticker_map = {}
+    ticker_map_source = "empty"
+    ticker_map_ready = True
+    print("[ticker_map] 모든 로드 실패")
+
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(build_ticker_map())
 
+
 # ──────────────────────────────────────────
 # 종목 검색 API
-# GET /api/search?q=삼성전자
-# → [{"ticker": "005930", "name": "삼성전자"}, ...]
 # ──────────────────────────────────────────
 @app.get("/api/search")
 def search_ticker(q: str):
     q = q.strip()
-    if not q or len(q) < 1:
+    if not q:
         return []
+    if not ticker_map:
+        if ticker_map_ready:
+            return [{"ticker": "", "name": "⚠️ 종목 목록 빌드 실패"}]
+        else:
+            return [{"ticker": "", "name": "⏳ 종목 목록 로딩 중..."}]
 
     q_lower = q.lower()
-    results = []
 
-    # 코드 직접 매칭 우선 (숫자 6자리 입력 시)
     if q.isdigit():
+        results = []
         for code, name in ticker_map.items():
             if code.startswith(q):
                 results.append({"ticker": code, "name": name})
@@ -86,36 +151,38 @@ def search_ticker(q: str):
                     return results
         return results
 
-    # 이름 매칭 (이름에 검색어가 포함되는 경우)
+    starts_with = []
+    contains = []
     for code, name in ticker_map.items():
-        if q_lower in name.lower():
-            results.append({"ticker": code, "name": name})
-            if len(results) >= 10:
-                break
+        name_lower = name.lower()
+        if name_lower.startswith(q_lower):
+            starts_with.append({"ticker": code, "name": name})
+        elif q_lower in name_lower:
+            contains.append({"ticker": code, "name": name})
 
-    # 아직 ticker_map 빌드 중이면 안내
-    if not results and not ticker_map_ready:
-        return [{"ticker": "", "name": "⏳ 종목 목록 로딩 중... 잠시 후 다시 검색해주세요"}]
-
+    results = starts_with[:10]
+    if len(results) < 10:
+        results.extend(contains[:10 - len(results)])
     return results
 
 
 # ──────────────────────────────────────────
-# 종가 조회 API (기존 유지)
+# 종가 조회 API
 # ──────────────────────────────────────────
 class TickerList(BaseModel):
     tickers: List[str]
 
+
 def normalize_ticker(ticker: str) -> str:
-    """A-prefix 제거 + 6자리 보정"""
     t = ticker.strip().upper()
     if t.startswith("A") and len(t) == 7 and t[1:].isdigit():
         t = t[1:]
     return t
 
+
 def is_valid_ticker(ticker: str) -> bool:
-    import re
     return bool(re.match(r'^[0-9A-Z]{6}$', ticker))
+
 
 def get_close_price(ticker: str):
     t = normalize_ticker(ticker)
@@ -134,7 +201,6 @@ def get_close_price(ticker: str):
                 close = int(row["종가"])
                 if close == 0:
                     continue
-                # 등락률 계산
                 try:
                     change_pct = float(row.get("등락률", 0))
                 except Exception:
@@ -144,12 +210,14 @@ def get_close_price(ticker: str):
             continue
     return None
 
+
 @app.get("/api/close/{ticker}")
 def get_close(ticker: str):
     result = get_close_price(ticker)
     if result is None:
         raise HTTPException(status_code=404, detail=f"가격 없음: {ticker}")
     return result
+
 
 @app.post("/api/closes")
 def get_closes(body: TickerList):
@@ -159,6 +227,7 @@ def get_closes(body: TickerList):
         if r:
             results[normalize_ticker(t)] = r
     return results
+
 
 @app.get("/api/ohlcv/{ticker}")
 def get_ohlcv(ticker: str, from_date: str = None, to_date: str = None):
@@ -187,6 +256,20 @@ def get_ohlcv(ticker: str, from_date: str = None, to_date: str = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "ticker_map_size": len(ticker_map), "ticker_map_ready": ticker_map_ready}
+    return {
+        "status": "ok",
+        "ticker_map_size": len(ticker_map),
+        "ticker_map_ready": ticker_map_ready,
+        "ticker_map_source": ticker_map_source,
+    }
+
+
+@app.post("/api/reload_tickers")
+async def reload_tickers():
+    global ticker_map_ready
+    ticker_map_ready = False
+    asyncio.create_task(build_ticker_map())
+    return {"status": "reload started"}
