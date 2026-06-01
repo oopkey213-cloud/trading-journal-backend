@@ -1,3 +1,7 @@
 fastapi
-   uvicorn[standard]
-   pykrx
+uvicorn[standard]
+pykrx
+finance-datareader
+pandas
+lxml
+requests
