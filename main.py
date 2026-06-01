@@ -82,11 +82,22 @@ def _set_cache(cache: dict, key, data, max_size: int = 200):
 
 
 def _normalize_ticker(ticker: str) -> str:
-    """종목코드를 6자리 0-padding 숫자로 정규화"""
-    t = (ticker or "").strip()
-    if not t.isdigit():
-        raise HTTPException(status_code=400, detail="종목코드는 숫자여야 합니다 (예: 005930)")
-    return t.zfill(6)
+    """종목코드 정규화.
+    
+    한국 종목: 일반 주식은 숫자 6자리 (예: 005930 삼성전자)
+    ETF/일부 신규 종목: 영문 섞인 6자리 코드도 있음 (예: 0195R0)
+    """
+    t = (ticker or "").strip().upper()
+    # 숫자만이면 6자리 0-padding (예: 5930 → 005930)
+    if t.isdigit():
+        return t.zfill(6)
+    # 영숫자 6자리 (ETF 등)
+    if len(t) == 6 and t.isalnum():
+        return t
+    raise HTTPException(
+        status_code=400,
+        detail=f"종목코드 형식 오류: '{ticker}' (숫자 6자리 또는 영숫자 6자리만 허용)"
+    )
 
 
 def _parse_date(s: str) -> str:
