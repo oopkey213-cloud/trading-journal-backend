@@ -1,333 +1,192 @@
-"""
-Trading Journal Data API
-한국 주식 일봉 데이터(OHLCV)를 pykrx로 가져와 프론트엔드에 제공.
-
-엔드포인트:
-  GET  /                                  - 헬스체크
-  GET  /health                            - 헬스체크 (UptimeRobot용)
-  GET  /api/ohlcv/{ticker}?days=365       - 종목 일봉 데이터 (최근 N일)
-  GET  /api/ohlcv/{ticker}?from=&to=      - 종목 일봉 데이터 (특정 기간)
-  GET  /api/name/{ticker}                 - 종목명 조회
-  GET  /api/close/{ticker}                - 종목 최신 종가 (보유 종목 미실현용)
-  POST /api/closes                        - 여러 종목 최신 종가 배치
-"""
-
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from pykrx import stock
-from datetime import datetime, timedelta
-from typing import List, Optional
-import time
+from pydantic import BaseModel
+from typing import List
+import datetime
+import asyncio
 
-app = FastAPI(title="Trading Journal Data API", version="0.2.0")
+app = FastAPI()
 
-# CORS 설정: v1 단계엔 모든 도메인 허용. 친구 공유 단계에서 도메인 제한 추가.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ──────────────────────────────────────────
+# 종목 검색용 전체 목록 캐시
+# 서버 시작 시 백그라운드에서 로드
+# ──────────────────────────────────────────
+ticker_map: dict = {}   # { "005930": "삼성전자" }
+ticker_map_ready = False
 
-@app.get("/")
-def root():
-    return {
-        "service": "trading-journal-data-api",
-        "status": "ok",
-        "version": "0.2.0",
-        "endpoints": [
-            "/health",
-            "/api/ohlcv/{ticker}?days=365",
-            "/api/ohlcv/{ticker}?from=YYYY-MM-DD&to=YYYY-MM-DD",
-            "/api/name/{ticker}",
-            "/api/close/{ticker}",
-            "/api/closes (POST body: {\"tickers\":[\"005930\",...]})",
-        ],
-    }
+def get_recent_trading_day() -> str:
+    """오늘 또는 가장 최근 거래일 (YYYYMMDD)"""
+    d = datetime.datetime.now()
+    # 주말이면 금요일로
+    if d.weekday() == 5:  # 토
+        d -= datetime.timedelta(days=1)
+    elif d.weekday() == 6:  # 일
+        d -= datetime.timedelta(days=2)
+    return d.strftime("%Y%m%d")
 
-
-@app.head("/health")
-@app.get("/health")
-def health():
-    """헬스체크 — UptimeRobot이 5분마다 호출해서 슬립 방지"""
-    return {"status": "ok"}
-
-
-# ----- 메모리 캐시 -----
-# pykrx 호출은 KRX 사이트 응답 대기 때문에 느림(2~5초). 메모리에 캐시.
-_CACHE_TTL_LONG = 3600       # 일봉/종목명: 1시간
-_CACHE_TTL_SHORT = 300       # 최신 종가: 5분
-_ohlcv_cache: dict = {}
-_name_cache: dict = {}
-_close_cache: dict = {}
-
-
-def _get_cached(cache: dict, key, ttl: int = _CACHE_TTL_LONG):
-    entry = cache.get(key)
-    if not entry:
-        return None
-    ts, data = entry
-    if time.time() - ts > ttl:
-        return None
-    return data
-
-
-def _set_cache(cache: dict, key, data, max_size: int = 200):
-    cache[key] = (time.time(), data)
-    if len(cache) > max_size:
-        oldest = min(cache.keys(), key=lambda k: cache[k][0])
-        cache.pop(oldest, None)
-
-
-def _normalize_ticker(ticker: str) -> str:
-    """종목코드 정규화.
-    
-    한국 종목: 일반 주식은 숫자 6자리 (예: 005930 삼성전자)
-    ETF/일부 신규 종목: 영문 섞인 6자리 코드도 있음 (예: 0195R0)
-    """
-    t = (ticker or "").strip().upper()
-    # 숫자만이면 6자리 0-padding (예: 5930 → 005930)
-    if t.isdigit():
-        return t.zfill(6)
-    # 영숫자 6자리 (ETF 등)
-    if len(t) == 6 and t.isalnum():
-        return t
-    raise HTTPException(
-        status_code=400,
-        detail=f"종목코드 형식 오류: '{ticker}' (숫자 6자리 또는 영숫자 6자리만 허용)"
-    )
-
-
-def _parse_date(s: str) -> str:
-    """YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD → YYYYMMDD"""
-    if not s:
-        return ""
-    s = s.strip().replace("-", "").replace("/", "")
-    if not (len(s) == 8 and s.isdigit()):
-        raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {s} (YYYY-MM-DD 형식)")
-    return s
-
-
-@app.get("/api/ohlcv/{ticker}")
-def get_ohlcv(
-    ticker: str,
-    days: Optional[int] = Query(None, ge=1, le=3650, description="가져올 일수 (from/to 미지정시)"),
-    from_date: Optional[str] = Query(None, alias="from", description="시작일 YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, alias="to", description="종료일 YYYY-MM-DD (기본 오늘)"),
-):
-    """종목 일봉 데이터(OHLCV) 조회
-
-    두 가지 모드:
-    1. days만 지정: 오늘 기준 최근 N일
-       예: /api/ohlcv/005930?days=365
-    2. from/to 지정: 특정 기간 (매도 후 추적용)
-       예: /api/ohlcv/005930?from=2025-04-01&to=2025-05-01
-
-    반환:
-    {
-        "ticker": "005930",
-        "name": "삼성전자",
-        "from": "20250401",
-        "to": "20250501",
-        "candles": [
-            {"date":"2025-04-01","open":70000,"high":72000,"low":69500,
-             "close":71500,"volume":12345678},
-            ...
-        ],
-        "fetched_at": "2025-05-18T..."
-    }
-    """
-    ticker = _normalize_ticker(ticker)
-
-    # 모드 결정
-    if from_date or to_date:
-        if not from_date:
-            raise HTTPException(status_code=400, detail="from 파라미터가 필요합니다")
-        start_str = _parse_date(from_date)
-        end_str = _parse_date(to_date) if to_date else datetime.now().strftime("%Y%m%d")
-        cache_key = (ticker, "range", start_str, end_str)
-    else:
-        d = days or 365
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=d)
-        start_str = start_date.strftime("%Y%m%d")
-        end_str = end_date.strftime("%Y%m%d")
-        cache_key = (ticker, "days", d)
-
-    cached = _get_cached(_ohlcv_cache, cache_key)
-    if cached:
-        return cached
-
+async def build_ticker_map():
+    """KOSPI + KOSDAQ 전체 종목 코드-이름 매핑 빌드 (백그라운드)"""
+    global ticker_map, ticker_map_ready
     try:
-        df = stock.get_market_ohlcv(start_str, end_str, ticker)
-
-        if df is None or df.empty:
-            raise HTTPException(
-                status_code=404,
-                detail=f"종목 {ticker} 데이터 없음 — 코드 확인 필요",
-            )
-
-        # 종목명
-        name = ""
-        try:
-            name = stock.get_market_ticker_name(ticker) or ""
-        except Exception:
-            pass
-
-        candles = []
-        for date, row in df.iterrows():
-            candles.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "open": int(row["시가"]),
-                "high": int(row["고가"]),
-                "low": int(row["저가"]),
-                "close": int(row["종가"]),
-                "volume": int(row["거래량"]),
-            })
-
-        result = {
-            "ticker": ticker,
-            "name": name,
-            "from": start_str,
-            "to": end_str,
-            "candles": candles,
-            "fetched_at": datetime.now().isoformat(),
-        }
-
-        _set_cache(_ohlcv_cache, cache_key, result)
-        return result
-
-    except HTTPException:
-        raise
+        date = get_recent_trading_day()
+        result = {}
+        for market in ["KOSPI", "KOSDAQ"]:
+            try:
+                codes = stock.get_market_ticker_list(date=date, market=market)
+                for code in codes:
+                    if code not in result:
+                        try:
+                            name = stock.get_market_ticker_name(code)
+                            if name:
+                                result[code] = name
+                        except Exception:
+                            pass
+                    # 과도한 요청 방지
+                    await asyncio.sleep(0.005)
+            except Exception as e:
+                print(f"[ticker_map] {market} 로드 실패: {e}")
+        ticker_map = result
+        ticker_map_ready = True
+        print(f"[ticker_map] 로드 완료: {len(ticker_map)}개 종목")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"데이터 가져오기 실패: {type(e).__name__}: {str(e)}",
-        )
+        print(f"[ticker_map] 전체 실패: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(build_ticker_map())
+
+# ──────────────────────────────────────────
+# 종목 검색 API
+# GET /api/search?q=삼성전자
+# → [{"ticker": "005930", "name": "삼성전자"}, ...]
+# ──────────────────────────────────────────
+@app.get("/api/search")
+def search_ticker(q: str):
+    q = q.strip()
+    if not q or len(q) < 1:
+        return []
+
+    q_lower = q.lower()
+    results = []
+
+    # 코드 직접 매칭 우선 (숫자 6자리 입력 시)
+    if q.isdigit():
+        for code, name in ticker_map.items():
+            if code.startswith(q):
+                results.append({"ticker": code, "name": name})
+                if len(results) >= 10:
+                    return results
+        return results
+
+    # 이름 매칭 (이름에 검색어가 포함되는 경우)
+    for code, name in ticker_map.items():
+        if q_lower in name.lower():
+            results.append({"ticker": code, "name": name})
+            if len(results) >= 10:
+                break
+
+    # 아직 ticker_map 빌드 중이면 안내
+    if not results and not ticker_map_ready:
+        return [{"ticker": "", "name": "⏳ 종목 목록 로딩 중... 잠시 후 다시 검색해주세요"}]
+
+    return results
 
 
-@app.get("/api/name/{ticker}")
-def get_ticker_name(ticker: str):
-    """종목코드로 종목명만 빠르게 조회"""
-    ticker = _normalize_ticker(ticker)
-
-    cached = _get_cached(_name_cache, ticker)
-    if cached:
-        return cached
-
-    try:
-        name = stock.get_market_ticker_name(ticker) or ""
-        result = {"ticker": ticker, "name": name}
-        _set_cache(_name_cache, ticker, result, max_size=1000)
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"종목명 조회 실패: {type(e).__name__}: {str(e)}",
-        )
-
-
-# ===== 최신 종가 (보유 종목 미실현 손익용) =====
-
-def _fetch_latest_close(ticker: str) -> dict:
-    """단일 종목 최신 종가. 토/일/공휴일이면 직전 영업일 종가."""
-    ticker = _normalize_ticker(ticker)
-
-    cached = _get_cached(_close_cache, ticker, ttl=_CACHE_TTL_SHORT)
-    if cached:
-        return cached
-
-    # 직전 10일 범위로 조회 (휴장 안전망). 가장 마지막 candle = 최신 종가.
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=10)
-    start_str = start_date.strftime("%Y%m%d")
-    end_str = end_date.strftime("%Y%m%d")
-
-    df = stock.get_market_ohlcv(start_str, end_str, ticker)
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail=f"종목 {ticker} 종가 데이터 없음")
-
-    last_row = df.iloc[-1]
-    last_date = df.index[-1]
-    last_close = int(last_row["종가"])
-
-    # 전일 종가 (등락률 계산용)
-    prev_close = int(df.iloc[-2]["종가"]) if len(df) >= 2 else None
-    change = (last_close - prev_close) if prev_close is not None else None
-    change_pct = (change / prev_close * 100) if (prev_close and prev_close > 0) else None
-
-    result = {
-        "ticker": ticker,
-        "date": last_date.strftime("%Y-%m-%d"),
-        "close": last_close,
-        "prev_close": prev_close,
-        "change": change,
-        "change_pct": change_pct,
-    }
-    _set_cache(_close_cache, ticker, result, max_size=500)
-    return result
-
-
-@app.get("/api/close/{ticker}")
-def get_latest_close(ticker: str):
-    """단일 종목 최신 종가. 보유 카드 미실현 손익 계산용.
-
-    토/일/공휴일 호출 시 직전 영업일 종가 반환.
-
-    반환:
-    {
-        "ticker": "005930",
-        "date": "2025-05-17",
-        "close": 71500,
-        "prev_close": 71000,
-        "change": 500,
-        "change_pct": 0.7042
-    }
-    """
-    try:
-        return _fetch_latest_close(ticker)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"종가 조회 실패: {type(e).__name__}: {str(e)}",
-        )
-
-
-class ClosesRequest(BaseModel):
+# ──────────────────────────────────────────
+# 종가 조회 API (기존 유지)
+# ──────────────────────────────────────────
+class TickerList(BaseModel):
     tickers: List[str]
 
+def normalize_ticker(ticker: str) -> str:
+    """A-prefix 제거 + 6자리 보정"""
+    t = ticker.strip().upper()
+    if t.startswith("A") and len(t) == 7 and t[1:].isdigit():
+        t = t[1:]
+    return t
+
+def is_valid_ticker(ticker: str) -> bool:
+    import re
+    return bool(re.match(r'^[0-9A-Z]{6}$', ticker))
+
+def get_close_price(ticker: str):
+    t = normalize_ticker(ticker)
+    if not is_valid_ticker(t):
+        return None
+    today = datetime.datetime.now()
+    for i in range(5):
+        target = today - datetime.timedelta(days=i)
+        if target.weekday() >= 5:
+            continue
+        date_str = target.strftime("%Y%m%d")
+        try:
+            df = stock.get_market_ohlcv(date_str, date_str, t)
+            if df is not None and not df.empty:
+                row = df.iloc[-1]
+                close = int(row["종가"])
+                if close == 0:
+                    continue
+                # 등락률 계산
+                try:
+                    change_pct = float(row.get("등락률", 0))
+                except Exception:
+                    change_pct = 0.0
+                return {"ticker": t, "close": close, "change_pct": round(change_pct, 2), "date": date_str}
+        except Exception:
+            continue
+    return None
+
+@app.get("/api/close/{ticker}")
+def get_close(ticker: str):
+    result = get_close_price(ticker)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"가격 없음: {ticker}")
+    return result
 
 @app.post("/api/closes")
-def get_latest_closes(body: ClosesRequest):
-    """여러 종목 최신 종가 한 번에 조회.
+def get_closes(body: TickerList):
+    results = {}
+    for t in body.tickers:
+        r = get_close_price(t)
+        if r:
+            results[normalize_ticker(t)] = r
+    return results
 
-    Body: { "tickers": ["005930", "000660", "035420"] }
+@app.get("/api/ohlcv/{ticker}")
+def get_ohlcv(ticker: str, from_date: str = None, to_date: str = None):
+    t = normalize_ticker(ticker)
+    if not is_valid_ticker(t):
+        raise HTTPException(status_code=400, detail="유효하지 않은 종목코드")
+    if not from_date:
+        from_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y%m%d")
+    if not to_date:
+        to_date = datetime.datetime.now().strftime("%Y%m%d")
+    try:
+        df = stock.get_market_ohlcv(from_date, to_date, t)
+        if df is None or df.empty:
+            return []
+        result = []
+        for date_idx, row in df.iterrows():
+            result.append({
+                "date": str(date_idx)[:10].replace("-", ""),
+                "open": int(row.get("시가", 0)),
+                "high": int(row.get("고가", 0)),
+                "low": int(row.get("저가", 0)),
+                "close": int(row.get("종가", 0)),
+                "volume": int(row.get("거래량", 0)),
+            })
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    각 종목별로 캐시 활용. 일부 실패해도 나머지는 정상 반환.
-
-    반환:
-    {
-        "results": [{ticker, date, close, prev_close, change, change_pct}, ...],
-        "errors":  [{"ticker": "...", "error": "..."}],
-        "fetched_at": "..."
-    }
-    """
-    results = []
-    errors = []
-    for raw in (body.tickers or []):
-        try:
-            data = _fetch_latest_close(raw)
-            results.append(data)
-        except HTTPException as e:
-            errors.append({"ticker": raw, "error": str(e.detail)})
-        except Exception as e:
-            errors.append({"ticker": raw, "error": f"{type(e).__name__}: {str(e)}"})
-    return {
-        "results": results,
-        "errors": errors,
-        "fetched_at": datetime.now().isoformat(),
-    }
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "ticker_map_size": len(ticker_map), "ticker_map_ready": ticker_map_ready}
