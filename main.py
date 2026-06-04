@@ -295,6 +295,7 @@ class NotionTrade(BaseModel):
 
 
 class NotionImage(BaseModel):
+    id: str = ""
     dataUrl: str = ""
 
 
@@ -307,6 +308,7 @@ class NotionExportBody(BaseModel):
     content: str = ""
     trades: List[NotionTrade] = []
     images: List[NotionImage] = []
+    stocks: List[str] = []      # 공부노트용 관련 종목 (예: ["삼성전자 (005930)"])
 
 
 def _markup_to_richtext(text: str):
@@ -344,15 +346,19 @@ def _markup_to_richtext(text: str):
     return rich
 
 
-def _build_blocks(body: NotionExportBody):
+def _build_blocks(body: NotionExportBody, uploaded_images: dict):
+    """uploaded_images: {도구 이미지 id: notion file_upload id}"""
     children = []
+    used_img_ids = set()
 
-    # 1) 날짜 + 태그 콜아웃
+    # 1) 날짜 + 태그 + 관련종목 콜아웃
     meta_parts = []
     if body.entry_date:
         meta_parts.append(f"📅 {body.entry_date}")
     if body.tags:
         meta_parts.append("🏷 " + ", ".join(body.tags))
+    if body.stocks:
+        meta_parts.append("📈 " + ", ".join(body.stocks))
     if meta_parts:
         children.append({
             "object": "block",
@@ -400,19 +406,41 @@ def _build_blocks(body: NotionExportBody):
             }
         })
 
-    # 3) 본문 (줄 단위 → paragraph)
+    # 3) 본문 — [[img:id]] 토큰 위치에 이미지 블록 삽입
     if body.content:
+        token_re = re.compile(r'\[\[img:([a-f0-9\-]+)\]\]')
         for line in body.content.split("\n"):
-            if line.strip() == "":
+            stripped = line.strip()
+            # 줄 전체가 이미지 토큰 하나인 경우
+            m_full = re.fullmatch(r'\[\[img:([a-f0-9\-]+)\]\]', stripped)
+            if m_full:
+                iid = m_full.group(1)
+                fid = uploaded_images.get(iid)
+                if fid:
+                    children.append({
+                        "object": "block", "type": "image",
+                        "image": {"type": "file_upload", "file_upload": {"id": fid}}
+                    })
+                    used_img_ids.add(iid)
+                continue
+            # 빈 줄
+            if stripped == "":
                 children.append({"object": "block", "type": "paragraph",
                                  "paragraph": {"rich_text": []}})
-            else:
+                continue
+            # 줄 안에 토큰이 섞여있으면 제거 후 텍스트로
+            # (사용된 토큰 id는 used에 기록해서 끝에 중복 첨부 방지)
+            for tm in token_re.finditer(line):
+                if tm.group(1) in uploaded_images:
+                    used_img_ids.add(tm.group(1))
+            clean = token_re.sub('', line)
+            if clean.strip():
                 children.append({
                     "object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": _markup_to_richtext(line)}
+                    "paragraph": {"rich_text": _markup_to_richtext(clean)}
                 })
 
-    return children[:100]  # Notion 페이지 생성 시 한 번에 100블록 제한
+    return children, used_img_ids
 
 
 def _upload_image_to_notion(token: str, data_url: str, idx: int):
@@ -471,14 +499,33 @@ def notion_export(body: NotionExportBody):
         "Content-Type": "application/json",
     }
 
-    # 1) 페이지 생성
-    children = _build_blocks(body)
+    # 1) 이미지 먼저 업로드 → {도구 이미지 id: notion file id}
+    uploaded = {}
+    img_errors = []
+    no_id_uploads = []   # id 없는 이미지의 file id (끝에 첨부)
+    for idx, img in enumerate(body.images):
+        fid, err = _upload_image_to_notion(body.token, img.dataUrl, idx)
+        if err:
+            img_errors.append(f"이미지{idx+1}: {err}")
+            continue
+        if img.id:
+            uploaded[img.id] = fid
+        else:
+            no_id_uploads.append(fid)
+
+    # 2) 블록 구성 (본문 토큰 위치에 이미지 삽입)
+    all_children, used_ids = _build_blocks(body, uploaded)
+
+    # 3) 페이지 생성 (첫 100블록만)
+    first_batch = all_children[:100]
+    rest_blocks = all_children[100:]
+
     payload = {
         "parent": {"page_id": body.parent_page_id},
         "properties": {
             "title": {"title": [{"type": "text", "text": {"content": body.title or "매매 일지"}}]}
         },
-        "children": children,
+        "children": first_batch,
     }
     try:
         res = requests.post(f"{NOTION_API}/pages", headers=headers, json=payload, timeout=30)
@@ -491,32 +538,39 @@ def notion_export(body: NotionExportBody):
     page_id = page["id"]
     page_url = page.get("url", "")
 
-    # 2) 이미지 업로드 + 첨부
-    img_errors = []
-    img_ok = 0
-    for idx, img in enumerate(body.images):
-        fid, err = _upload_image_to_notion(body.token, img.dataUrl, idx)
-        if err:
-            img_errors.append(f"이미지{idx+1}: {err}")
-            continue
-        # 이미지 블록 append
+    def _append(blocks):
         try:
-            ap = requests.patch(
-                f"{NOTION_API}/blocks/{page_id}/children",
-                headers=headers,
-                json={"children": [{
-                    "object": "block", "type": "image",
-                    "image": {"type": "file_upload", "file_upload": {"id": fid}}
-                }]},
-                timeout=30
-            )
-            if ap.status_code == 200:
-                img_ok += 1
-            else:
-                img_errors.append(f"이미지{idx+1}: 첨부 실패 {ap.status_code}")
+            r = requests.patch(f"{NOTION_API}/blocks/{page_id}/children",
+                               headers=headers, json={"children": blocks}, timeout=30)
+            return r.status_code == 200, (r.text[:120] if r.status_code != 200 else "")
         except Exception as e:
-            img_errors.append(f"이미지{idx+1}: 첨부 예외 {e}")
+            return False, str(e)[:120]
 
+    # 4) 100블록 초과분 append (100개씩)
+    for i in range(0, len(rest_blocks), 100):
+        ok, err = _append(rest_blocks[i:i+100])
+        if not ok:
+            img_errors.append(f"본문 일부 첨부 실패: {err}")
+
+    # 5) 본문 토큰에 안 쓰인 이미지(id 있지만 토큰 없음) + id 없는 이미지 → 끝에 첨부
+    tail_blocks = []
+    for tool_id, fid in uploaded.items():
+        if tool_id not in used_ids:
+            tail_blocks.append({
+                "object": "block", "type": "image",
+                "image": {"type": "file_upload", "file_upload": {"id": fid}}
+            })
+    for fid in no_id_uploads:
+        tail_blocks.append({
+            "object": "block", "type": "image",
+            "image": {"type": "file_upload", "file_upload": {"id": fid}}
+        })
+    for i in range(0, len(tail_blocks), 100):
+        ok, err = _append(tail_blocks[i:i+100])
+        if not ok:
+            img_errors.append(f"이미지 첨부 실패: {err}")
+
+    img_ok = len(uploaded) + len(no_id_uploads)
     return {
         "status": "ok",
         "page_url": page_url,
