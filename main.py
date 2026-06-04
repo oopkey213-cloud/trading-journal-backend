@@ -273,3 +273,254 @@ async def reload_tickers():
     ticker_map_ready = False
     asyncio.create_task(build_ticker_map())
     return {"status": "reload started"}
+
+
+# ──────────────────────────────────────────
+# Notion 연동 — 결산/공부일지를 Notion 페이지로 전송 (이미지 포함)
+# ──────────────────────────────────────────
+import base64
+import io
+import requests
+
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+
+
+class NotionTrade(BaseModel):
+    side: str = ""          # BUY / SELL
+    stock_name: str = ""
+    ticker: str = ""
+    quantity: float = 0
+    price: float = 0
+
+
+class NotionImage(BaseModel):
+    dataUrl: str = ""
+
+
+class NotionExportBody(BaseModel):
+    token: str
+    parent_page_id: str
+    title: str = "매매 일지"
+    entry_date: str = ""
+    tags: List[str] = []
+    content: str = ""
+    trades: List[NotionTrade] = []
+    images: List[NotionImage] = []
+
+
+def _markup_to_richtext(text: str):
+    """도구 마크업(**bold**, {r}red{/r}, {b}blue{/b}, {g}blue{/g})을 Notion rich_text로 변환"""
+    pattern = re.compile(
+        r'\*\*(.+?)\*\*|\{r\}(.+?)\{/r\}|\{b\}(.+?)\{/b\}|\{g\}(.+?)\{/g\}',
+        re.DOTALL
+    )
+    rich = []
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            plain = text[pos:m.start()]
+            if plain:
+                rich.append({"type": "text", "text": {"content": plain[:2000]}})
+        if m.group(1) is not None:        # **bold**
+            rich.append({"type": "text", "text": {"content": m.group(1)[:2000]},
+                         "annotations": {"bold": True}})
+        elif m.group(2) is not None:      # {r}red{/r}
+            rich.append({"type": "text", "text": {"content": m.group(2)[:2000]},
+                         "annotations": {"color": "red", "bold": True}})
+        elif m.group(3) is not None:      # {b}blue{/b}
+            rich.append({"type": "text", "text": {"content": m.group(3)[:2000]},
+                         "annotations": {"color": "blue", "bold": True}})
+        elif m.group(4) is not None:      # {g}blue{/g} (레거시)
+            rich.append({"type": "text", "text": {"content": m.group(4)[:2000]},
+                         "annotations": {"color": "blue", "bold": True}})
+        pos = m.end()
+    if pos < len(text):
+        plain = text[pos:]
+        if plain:
+            rich.append({"type": "text", "text": {"content": plain[:2000]}})
+    if not rich:
+        rich.append({"type": "text", "text": {"content": (text or "")[:2000]}})
+    return rich
+
+
+def _build_blocks(body: NotionExportBody):
+    children = []
+
+    # 1) 날짜 + 태그 콜아웃
+    meta_parts = []
+    if body.entry_date:
+        meta_parts.append(f"📅 {body.entry_date}")
+    if body.tags:
+        meta_parts.append("🏷 " + ", ".join(body.tags))
+    if meta_parts:
+        children.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": "    ".join(meta_parts)}}],
+                "icon": {"emoji": "📌"},
+                "color": "gray_background",
+            }
+        })
+
+    # 2) 매매 내역 표
+    if body.trades:
+        rows = [{
+            "type": "table_row",
+            "table_row": {"cells": [
+                [{"type": "text", "text": {"content": "구분"}}],
+                [{"type": "text", "text": {"content": "종목"}}],
+                [{"type": "text", "text": {"content": "수량"}}],
+                [{"type": "text", "text": {"content": "단가"}}],
+            ]}
+        }]
+        for t in body.trades:
+            side = "매수" if (t.side or "").upper() == "BUY" else "매도"
+            qty = f"{int(t.quantity):,}" if t.quantity else ""
+            price = f"{int(t.price):,}" if t.price else ""
+            nm = t.stock_name + (f" ({t.ticker})" if t.ticker else "")
+            rows.append({
+                "type": "table_row",
+                "table_row": {"cells": [
+                    [{"type": "text", "text": {"content": side}}],
+                    [{"type": "text", "text": {"content": nm}}],
+                    [{"type": "text", "text": {"content": qty}}],
+                    [{"type": "text", "text": {"content": price}}],
+                ]}
+            })
+        children.append({
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": 4,
+                "has_column_header": True,
+                "has_row_header": False,
+                "children": rows,
+            }
+        })
+
+    # 3) 본문 (줄 단위 → paragraph)
+    if body.content:
+        for line in body.content.split("\n"):
+            if line.strip() == "":
+                children.append({"object": "block", "type": "paragraph",
+                                 "paragraph": {"rich_text": []}})
+            else:
+                children.append({
+                    "object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": _markup_to_richtext(line)}
+                })
+
+    return children[:100]  # Notion 페이지 생성 시 한 번에 100블록 제한
+
+
+def _upload_image_to_notion(token: str, data_url: str, idx: int):
+    """base64 dataURL을 Notion에 업로드하고 file_upload id 반환"""
+    if not data_url.startswith("data:"):
+        return None, "dataURL 형식 아님"
+    try:
+        header, b64 = data_url.split(",", 1)
+        mime = header.split(";")[0].replace("data:", "") or "image/png"
+        ext = mime.split("/")[-1] or "png"
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        return None, f"디코드 실패: {e}"
+
+    json_headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    # 1) 업로드 객체 생성
+    try:
+        r1 = requests.post(f"{NOTION_API}/file_uploads", headers=json_headers,
+                           json={"filename": f"image_{idx}.{ext}", "content_type": mime},
+                           timeout=30)
+        if r1.status_code != 200:
+            return None, f"업로드객체 실패 {r1.status_code}: {r1.text[:120]}"
+        fid = r1.json()["id"]
+    except Exception as e:
+        return None, f"업로드객체 예외: {e}"
+
+    # 2) 바이너리 전송 (multipart)
+    send_headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+    }
+    try:
+        files = {"file": (f"image_{idx}.{ext}", io.BytesIO(raw), mime)}
+        r2 = requests.post(f"{NOTION_API}/file_uploads/{fid}/send",
+                           headers=send_headers, files=files, timeout=60)
+        if r2.status_code != 200:
+            return None, f"전송 실패 {r2.status_code}: {r2.text[:120]}"
+    except Exception as e:
+        return None, f"전송 예외: {e}"
+
+    return fid, None
+
+
+@app.post("/api/notion/export")
+def notion_export(body: NotionExportBody):
+    if not body.token or not body.parent_page_id:
+        raise HTTPException(status_code=400, detail="token, parent_page_id 필수")
+
+    headers = {
+        "Authorization": f"Bearer {body.token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    # 1) 페이지 생성
+    children = _build_blocks(body)
+    payload = {
+        "parent": {"page_id": body.parent_page_id},
+        "properties": {
+            "title": {"title": [{"type": "text", "text": {"content": body.title or "매매 일지"}}]}
+        },
+        "children": children,
+    }
+    try:
+        res = requests.post(f"{NOTION_API}/pages", headers=headers, json=payload, timeout=30)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Notion 연결 실패: {e}")
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code,
+                            detail=f"페이지 생성 실패: {res.text[:300]}")
+    page = res.json()
+    page_id = page["id"]
+    page_url = page.get("url", "")
+
+    # 2) 이미지 업로드 + 첨부
+    img_errors = []
+    img_ok = 0
+    for idx, img in enumerate(body.images):
+        fid, err = _upload_image_to_notion(body.token, img.dataUrl, idx)
+        if err:
+            img_errors.append(f"이미지{idx+1}: {err}")
+            continue
+        # 이미지 블록 append
+        try:
+            ap = requests.patch(
+                f"{NOTION_API}/blocks/{page_id}/children",
+                headers=headers,
+                json={"children": [{
+                    "object": "block", "type": "image",
+                    "image": {"type": "file_upload", "file_upload": {"id": fid}}
+                }]},
+                timeout=30
+            )
+            if ap.status_code == 200:
+                img_ok += 1
+            else:
+                img_errors.append(f"이미지{idx+1}: 첨부 실패 {ap.status_code}")
+        except Exception as e:
+            img_errors.append(f"이미지{idx+1}: 첨부 예외 {e}")
+
+    return {
+        "status": "ok",
+        "page_url": page_url,
+        "image_total": len(body.images),
+        "image_ok": img_ok,
+        "image_errors": img_errors,
+    }
