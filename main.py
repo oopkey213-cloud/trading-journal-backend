@@ -428,6 +428,10 @@ def _build_blocks(body: NotionExportBody, uploaded_images: dict):
                 children.append({"object": "block", "type": "paragraph",
                                  "paragraph": {"rich_text": []}})
                 continue
+            # 구분선 (--- 또는 ———)
+            if stripped in ("---", "***", "———", "___"):
+                children.append({"object": "block", "type": "divider", "divider": {}})
+                continue
             # 줄 안에 토큰이 섞여있으면 제거 후 텍스트로
             # (사용된 토큰 id는 used에 기록해서 끝에 중복 첨부 방지)
             for tm in token_re.finditer(line):
