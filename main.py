@@ -267,6 +267,12 @@ def health():
     }
 
 
+@app.head("/api/health")
+def health_head():
+    # UptimeRobot 등 HEAD 요청 지원
+    return {}
+
+
 @app.post("/api/reload_tickers")
 async def reload_tickers():
     global ticker_map_ready
@@ -308,42 +314,83 @@ class NotionExportBody(BaseModel):
     content: str = ""
     trades: List[NotionTrade] = []
     images: List[NotionImage] = []
-    stocks: List[str] = []      # 공부노트용 관련 종목 (예: ["삼성전자 (005930)"])
+    stocks: List[str] = []       # 공부노트용 관련 종목 (예: ["삼성전자 (005930)"])
+    pnl_summary: str = ""        # 결산 손익 요약 (접이식 토글로 감쌈)
 
 
 def _markup_to_richtext(text: str):
-    """도구 마크업(**bold**, {r}red{/r}, {b}blue{/b}, {g}blue{/g})을 Notion rich_text로 변환"""
+    """도구 마크업을 Notion rich_text로 변환.
+    지원: **bold**, {r}빨강{/r}, {b}파랑{/b}, {g}파랑{/g}(레거시), {y}노란강조{/y}
+    - 별표 3개 이상(****, ***)은 2개로 정규화해서 볼드 처리
+    - 짝이 안 맞아 남은 ** 마커는 제거
+    """
+    # ****강조**** / ***강조*** → **강조** 로 정규화
+    text = re.sub(r'\*{3,}', '**', text)
+
+    def _clean_plain(s: str) -> str:
+        # 짝 안 맞고 남은 볼드 마커 제거
+        return s.replace('**', '')
+
     pattern = re.compile(
-        r'\*\*(.+?)\*\*|\{r\}(.+?)\{/r\}|\{b\}(.+?)\{/b\}|\{g\}(.+?)\{/g\}',
+        r'\*\*(.+?)\*\*'          # 1: **bold**
+        r'|\{r\}(.+?)\{/r\}'      # 2: 빨강
+        r'|\{b\}(.+?)\{/b\}'      # 3: 파랑
+        r'|\{g\}(.+?)\{/g\}'      # 4: 파랑(레거시)
+        r'|\{y\}(.+?)\{/y\}',     # 5: 노란 강조
         re.DOTALL
     )
     rich = []
     pos = 0
     for m in pattern.finditer(text):
         if m.start() > pos:
-            plain = text[pos:m.start()]
+            plain = _clean_plain(text[pos:m.start()])
             if plain:
                 rich.append({"type": "text", "text": {"content": plain[:2000]}})
         if m.group(1) is not None:        # **bold**
             rich.append({"type": "text", "text": {"content": m.group(1)[:2000]},
                          "annotations": {"bold": True}})
-        elif m.group(2) is not None:      # {r}red{/r}
+        elif m.group(2) is not None:      # {r}빨강{/r}
             rich.append({"type": "text", "text": {"content": m.group(2)[:2000]},
                          "annotations": {"color": "red", "bold": True}})
-        elif m.group(3) is not None:      # {b}blue{/b}
+        elif m.group(3) is not None:      # {b}파랑{/b}
             rich.append({"type": "text", "text": {"content": m.group(3)[:2000]},
                          "annotations": {"color": "blue", "bold": True}})
-        elif m.group(4) is not None:      # {g}blue{/g} (레거시)
+        elif m.group(4) is not None:      # {g}파랑{/g} (레거시)
             rich.append({"type": "text", "text": {"content": m.group(4)[:2000]},
                          "annotations": {"color": "blue", "bold": True}})
+        elif m.group(5) is not None:      # {y}노란 강조{/y}
+            rich.append({"type": "text", "text": {"content": m.group(5)[:2000]},
+                         "annotations": {"color": "yellow_background", "bold": True}})
         pos = m.end()
     if pos < len(text):
-        plain = text[pos:]
+        plain = _clean_plain(text[pos:])
         if plain:
             rich.append({"type": "text", "text": {"content": plain[:2000]}})
     if not rich:
-        rich.append({"type": "text", "text": {"content": (text or "")[:2000]}})
+        cleaned = _clean_plain(text or "")
+        rich.append({"type": "text", "text": {"content": cleaned[:2000]}})
     return rich
+
+
+def _pnl_summary_toggle(pnl_summary: str):
+    """결산 손익 요약 텍스트를 '📊 결산 손익 요약' 접이식 토글 블록으로 변환"""
+    toggle_children = []
+    for ln in pnl_summary.split("\n"):
+        if ln.strip() == "":
+            continue
+        toggle_children.append({
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": _markup_to_richtext(ln)}
+        })
+    return {
+        "object": "block", "type": "toggle",
+        "toggle": {
+            "rich_text": [{"type": "text", "text": {"content": "📊 결산 손익 요약"},
+                           "annotations": {"bold": True}}],
+            "color": "gray_background",
+            "children": toggle_children[:100],
+        }
+    }
 
 
 def _build_blocks(body: NotionExportBody, uploaded_images: dict):
@@ -369,6 +416,10 @@ def _build_blocks(body: NotionExportBody, uploaded_images: dict):
                 "color": "gray_background",
             }
         })
+
+    # 1.5) 결산 손익 요약 — 접이식 토글 (문서가 길어지지 않게 접어둠)
+    if body.pnl_summary and body.pnl_summary.strip():
+        children.append(_pnl_summary_toggle(body.pnl_summary))
 
     # 2) 매매 내역 표
     if body.trades:
@@ -407,13 +458,18 @@ def _build_blocks(body: NotionExportBody, uploaded_images: dict):
         })
 
     # 3) 본문 — [[img:id]] 토큰 위치에 이미지 블록 삽입
+    #    가독성 개선: 연속 빈 줄 1개로 축약, #/##/### 소제목을 heading 블록으로
     if body.content:
         token_re = re.compile(r'\[\[img:([a-f0-9\-]+)\]\]')
+        heading_type = {1: "heading_1", 2: "heading_2", 3: "heading_3"}
+        prev_blank = False
         for line in body.content.split("\n"):
             stripped = line.strip()
+
             # 줄 전체가 이미지 토큰 하나인 경우
             m_full = re.fullmatch(r'\[\[img:([a-f0-9\-]+)\]\]', stripped)
             if m_full:
+                prev_blank = False
                 iid = m_full.group(1)
                 fid = uploaded_images.get(iid)
                 if fid:
@@ -423,17 +479,37 @@ def _build_blocks(body: NotionExportBody, uploaded_images: dict):
                     })
                     used_img_ids.add(iid)
                 continue
-            # 빈 줄
+
+            # 빈 줄 — 연속 빈 줄은 1개로만
             if stripped == "":
-                children.append({"object": "block", "type": "paragraph",
-                                 "paragraph": {"rich_text": []}})
+                if not prev_blank:
+                    children.append({"object": "block", "type": "paragraph",
+                                     "paragraph": {"rich_text": []}})
+                prev_blank = True
                 continue
+            prev_blank = False
+
             # 구분선 (--- 또는 ———)
             if stripped in ("---", "***", "———", "___"):
                 children.append({"object": "block", "type": "divider", "divider": {}})
                 continue
+
+            # 소제목 (# ## ###)
+            h = re.match(r'^(#{1,3})\s+(.*)$', stripped)
+            if h:
+                htype = heading_type[len(h.group(1))]
+                htext = h.group(2)
+                for tm in token_re.finditer(htext):
+                    if tm.group(1) in uploaded_images:
+                        used_img_ids.add(tm.group(1))
+                htext = token_re.sub('', htext)
+                children.append({
+                    "object": "block", "type": htype,
+                    htype: {"rich_text": _markup_to_richtext(htext)}
+                })
+                continue
+
             # 줄 안에 토큰이 섞여있으면 제거 후 텍스트로
-            # (사용된 토큰 id는 used에 기록해서 끝에 중복 첨부 방지)
             for tm in token_re.finditer(line):
                 if tm.group(1) in uploaded_images:
                     used_img_ids.add(tm.group(1))
